@@ -45,7 +45,7 @@ mssql-mcp-server
 
 ```bash
 # Clone and install
-git clone <repository-url>
+git clone https://github.com/PiyapatRag/mssql-mcp-server.git
 cd mssql-mcp-server
 npm install
 npm run build
@@ -247,10 +247,10 @@ limits (e.g. Express: 10 GB/database, ~1.4 GB buffer pool, 4 cores).
 **Claude Examples:**
 ```
 "Show me the top 10 customers by order count"
-"ตารางไหนใหญ่สุด และมี index ที่ไม่ได้ใช้บ้าง"
-"มี session ไหนโดน block อยู่ตอนนี้ ใครเป็นตัวต้นเหตุ"
-"เมื่อคืนมี deadlock ไหม เกิดจาก query อะไร"
-"หา stored procedure ทุกตัวที่แตะตาราง CustomerOrders"
+"Which tables are the largest, and which indexes are unused?"
+"Which sessions are blocked right now, and who is the root blocker?"
+"Were there any deadlocks last night, and which query caused them?"
+"Find every stored procedure that references the CustomerOrders table"
 ```
 
 ## Security Setup

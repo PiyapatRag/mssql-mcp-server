@@ -24,7 +24,7 @@
     "claude",
     "monitoring"
   ],
-  "author": "",
+  "author": "PiyapatRag (https://github.com/PiyapatRag)",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

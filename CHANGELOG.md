@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-07-24
+
+### Changed
+- Corrected package `homepage` and `repository` metadata to point at the
+  actual GitHub repository.
+- Translated the example Claude prompts in the README to English.
+
+### Added
+- `CHANGELOG.md`, `CONTRIBUTING.md`, and `.github/FUNDING.yml` (GitHub Sponsors).
+- npm version/downloads/node/license/sponsor badges and an npm package
+  reference in the README.
+
 ## [2.0.0] - 2026-07-24
 
 ### Added
