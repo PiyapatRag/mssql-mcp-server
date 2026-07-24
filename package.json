@@ -1,0 +1,45 @@
+{
+  "name": "@piyapat/mssql-mcp-server",
+  "version": "2.0.0",
+  "description": "Secure, read-only MCP server for Microsoft SQL Server with performance monitoring",
+  "main": "build/index.js",
+  "bin": {
+    "mssql-mcp-server": "build/index.js"
+  },
+  "files": [
+    "build"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node build/index.js",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "mssql",
+    "sql-server",
+    "database",
+    "model-context-protocol",
+    "claude",
+    "monitoring"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "mssql": "^11.0.1"
+  },
+  "devDependencies": {
+    "@types/mssql": "^9.1.5",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PiyapatRag/mssql-mcp-server"
+  }
+}

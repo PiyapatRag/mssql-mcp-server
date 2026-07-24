@@ -1,0 +1,11 @@
+# These are supported funding model platforms
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+
+github: [PiyapatRag]              # GitHub Sponsors username(s)
+
+# --- Other platforms (uncomment and fill in if you use them) ---
+# ko_fi: your-kofi-username
+# buy_me_a_coffee: your-username
+# patreon: your-username
+# open_collective: your-project
+# custom: ["https://paypal.me/your-handle"]
