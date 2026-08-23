@@ -1,0 +1,24 @@
+version: 2
+updates:
+  # Runtime/dev dependencies. The security surface here is mssql + tedious,
+  # which sit directly on the connection to the database, so patch updates are
+  # worth taking promptly.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      dev-dependencies:
+        dependency-type: development
+
+  # Pinned action versions go stale the same way dependencies do.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies

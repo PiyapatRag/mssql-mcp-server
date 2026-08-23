@@ -125,13 +125,15 @@ different databases.
 | `MSSQL_PASSWORD` | Password | - | Yes |
 | `MSSQL_DOMAIN` | Windows/NTLM domain. When set, Windows Authentication is used instead of SQL authentication | - | No |
 | `MSSQL_PORT` | SQL Server port | `1433` | No |
-| `MSSQL_ENCRYPT` | Use encryption (true/false) | `false` | No |
-| `MSSQL_TRUST_CERT` | Trust server certificate (true/false) | `false` | No |
+| `MSSQL_ENCRYPT` | Encrypt the connection (true/false). Only a literal `false` disables it | `true` | No |
+| `MSSQL_TRUST_CERT` | Skip certificate validation (true/false). Opt-in — leave off in production | `false` | No |
 | `MSSQL_READ_ONLY` | `true` = read-only allow-list validation. `false` = write mode: INSERT/UPDATE/DELETE/DDL allowed, but server-level dangerous statements stay blocked | `true` | No |
 | `MSSQL_ALLOWED_PROCEDURES` | Comma-separated whitelist of stored procedures `EXEC` may call in read-only mode, e.g. `dbo.GetReport,dbo.GetCustomerSummary`. Empty/unset disables `EXEC` entirely. | - | No |
 | `MSSQL_ENV_FILE` | Explicit path to a `.env` file | - | No |
 | `MSSQL_REQUEST_TIMEOUT` | Query timeout in ms | `30000` | No |
 | `MSSQL_POOL_MAX` | Max pooled connections | `10` | No |
+| `MSSQL_AUDIT_LOG` | Log every tool call to stderr as one JSON line (tool, mode, truncated query, row counts, duration, outcome). Set `false` to disable | `true` | No |
+| `MSSQL_VERBOSE_ERRORS` | Return the driver's full error text to the client. Off by default: errors are capped to their first line so a failing query can't be used to map the schema. Full detail always goes to stderr | `false` | No |
 
 ## Server Modes
 
@@ -158,10 +160,13 @@ and stacked statements after a `SELECT`/`WITH`/`EXEC`.
 `INSERT` / `UPDATE` / `DELETE` / DDL are permitted, but these are **always blocked**
 regardless of mode:
 
-`xp_cmdshell`, `xp_regwrite`/`xp_regdelete*`, `sp_configure`, `RECONFIGURE`,
-`SHUTDOWN`, `KILL`, `DROP DATABASE`, `ALTER DATABASE`, `RESTORE`,
+`xp_cmdshell`, `xp_reg*` (read and write), `xp_dirtree`, `xp_fileexist`,
+`sp_OA*`, `sp_configure`, `RECONFIGURE`, `SHUTDOWN`, `KILL`, `DROP DATABASE`,
+`ALTER DATABASE`, `RESTORE`, `BULK INSERT`, `CREATE ASSEMBLY`,
 `CREATE/ALTER/DROP LOGIN/USER/CREDENTIAL/CERTIFICATE`, `ALTER SERVER`,
-`GRANT`/`DENY`/`REVOKE`, `OPENROWSET`/`OPENDATASOURCE`.
+`ALTER SERVER ROLE`/`ALTER ROLE`, `sp_addrolemember`/`sp_addsrvrolemember`/
+`sp_droprolemember`, `sp_addlinkedserver`, `EXECUTE AS`, `sp_executesql`,
+`GRANT`/`DENY`/`REVOKE`, `OPENROWSET`/`OPENDATASOURCE`/`OPENQUERY`.
 
 > ⚠️ Use write mode only with a SQL login whose own permissions are equally
 > limited — the database login remains the primary security boundary.
@@ -170,8 +175,11 @@ regardless of mode:
 
 ### Security First
 - ✅ **Two-layer read-only enforcement** - A database read-only login (primary) plus an application-level allow-list (defense-in-depth). The app accepts `SELECT` / `WITH...SELECT`, `DECLARE` batches that write only to `#temp` tables / `@table` variables, and `EXEC` of whitelisted procedures whose definitions never write to a persistent table
+- ✅ **Quote-aware SQL scanning** - Comments and literals are removed in a single left-to-right pass that tracks quote state, so a `--` or `;` hidden inside a string literal cannot smuggle a second statement past the analyzer
 - ✅ **Parameterized queries** - Built-in SQL injection protection
-- ✅ **SSL/TLS support** - Encrypted connections for production
+- ✅ **SSL/TLS by default** - Encryption and certificate validation are opt-out, not opt-in
+- ✅ **Streamed result paging** - Rows are streamed and the read is cancelled one row past the requested page, so a large `SELECT` can't exhaust the server's memory
+- ✅ **Audit trail** - Every tool call is logged to stderr as one JSON line (`MSSQL_AUDIT_LOG`)
 - ✅ **Connection pooling** - Optimized resource management
 
 ### Performance Monitoring
@@ -376,15 +384,27 @@ GRANT EXECUTE TO mcp_readonly;  -- If you need to call stored procedures
 GRANT SHOWPLAN TO mcp_readonly; -- For execution plans
 ```
 
+## Reporting a Vulnerability
+
+Please don't open a public issue for a security bug. Use
+[GitHub private vulnerability reporting](https://github.com/PiyapatRag/mssql-mcp-server/security/advisories/new),
+or the maintainer address on the npm package page. Scope, response targets, and
+safe-harbor terms are in [SECURITY.md](SECURITY.md).
+
+The guard battery in
+[scripts/security-validation.mjs](scripts/security-validation.mjs) runs the real
+compiled analyzer against ~100 attack cases and runs in CI — `npm run
+test:security` reproduces it locally.
+
 ## Best Practices
 
 1. **Always use read-only accounts** in production
-2. **Enable SSL encryption** for network security
+2. **Keep encryption on** (`MSSQL_ENCRYPT=true`, `MSSQL_TRUST_CERT=false`) — both are the default
 3. **Monitor regularly** - Set up regular monitoring checks
-4. **Limit result sets** - Use maxRows to prevent memory issues
+4. **Limit result sets** - Use maxRows; rows are streamed, so a page is all that is read
 5. **Index optimization** - Monitor slow queries and add indexes
 6. **Regular maintenance** - Keep statistics updated
-7. **Audit access** - Track who queries what
+7. **Audit access** - Keep `MSSQL_AUDIT_LOG` on and retain the server's stderr log
 
 ## Contributing
 

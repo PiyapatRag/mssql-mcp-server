@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Dependencies rot even when nobody pushes — re-run the audit weekly so a
+  # newly disclosed advisory in a pinned dependency surfaces on its own.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & security regression (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # mssql 12 pulls tedious 20, whose engines field is ">=22" — Node 18/20
+        # cannot run this server, so testing them would only produce red builds.
+        node: ["22.x", "24.x"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check and build
+        run: npm run build
+
+      # The SQL guard battery in scripts/security-validation.mjs runs the real
+      # analyzer out of build/index.js. It is the regression test for the
+      # read-only bypass fixed in 2.0.2 — a parsing-order change that
+      # reintroduces the bug fails here rather than in the wild.
+      - name: Security regression battery
+        run: node scripts/security-validation.mjs
+
+  audit:
+    name: npm audit gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: npm
+
+      - run: npm ci
+
+      # Fails the build on a HIGH or CRITICAL advisory in the dependency tree.
+      - name: npm audit
+        run: npm audit --audit-level=high
+
+      # Informational: the full report, including low/moderate findings.
+      - name: npm audit (full report)
+        if: always()
+        run: npm audit || true

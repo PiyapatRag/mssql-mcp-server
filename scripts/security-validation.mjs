@@ -19,8 +19,54 @@ const dummy = new Proxy(function () {}, {
   apply: () => dummy,
   construct: () => ({}),
 });
+// A fake `mssql` module so the streaming pager (section H) can be exercised
+// without a live SQL Server. `fakeDb.rows` is the result set the fake driver
+// replays; `fakeDb.emitted` counts how many rows it actually got to send,
+// which is what proves the pager cancels instead of draining the whole set.
+import { EventEmitter } from "events";
+
+const fakeDb = { rows: [], emitted: 0 };
+
+class FakeRequest extends EventEmitter {
+  constructor() {
+    super();
+    this.stream = false;
+    this.canceled = false;
+  }
+  input() { return this; }
+  cancel() { this.canceled = true; }
+  async query() {
+    await new Promise((r) => setImmediate(r));
+    const first = fakeDb.rows[0];
+    this.emit("recordset", Object.fromEntries(Object.keys(first ?? {}).map((c) => [c, {}])));
+    for (const row of fakeDb.rows) {
+      if (this.canceled) break;
+      fakeDb.emitted += 1;
+      this.emit("row", row);
+      // Yield between rows so a cancel() issued from the row handler is
+      // observed, exactly as a real socket-driven stream would behave.
+      await new Promise((r) => setImmediate(r));
+    }
+    return { recordsets: [], recordset: [], output: {}, rowsAffected: [] };
+  }
+}
+
+// `__esModule` and `then` must read as absent: the compiled output runs the
+// module through __importDefault (which checks __esModule), and a truthy
+// `then` would make the module look like a thenable and hang the await.
+const fakeMssql = new Proxy(
+  { connect: async () => ({ request: () => new FakeRequest(), close: async () => {} }) },
+  {
+    get: (t, p) => (p in t ? t[p] : p === "__esModule" || p === "then" ? undefined : dummy),
+  }
+);
+
 const require = (name) =>
-  name === "fs" || name === "path" ? realRequire(name) : dummy;
+  name === "fs" || name === "path"
+    ? realRequire(name)
+    : name === "mssql"
+    ? fakeMssql
+    : dummy;
 
 // Eval the analyzer code and export the functions under test.
 const factory = new Function(
@@ -28,7 +74,8 @@ const factory = new Function(
   `"use strict";
    const __dirname = "/tmp";
    ${code}
-   return { classifyQuery, findDangerousStatement, writesToPersistentTable, quoteTableName, READ_ONLY };`
+   return { classifyQuery, findDangerousStatement, writesToPersistentTable, quoteTableName,
+            coerceInt, describeError, handleMssqlQuery, READ_ONLY };`
 );
 const api = factory(require, {});
 
@@ -126,6 +173,82 @@ check("bracketed ok", quoteOk("[dbo].[Order Details]"), true);
 check("injection via semicolon rejected", quoteOk("Orders; DROP TABLE Users--"), false);
 check("injection via quote rejected", quoteOk("Orders' OR '1'='1"), false);
 check("three-part name rejected", quoteOk("server.dbo.Orders"), false);
+
+console.log("\n=== F. Numeric argument validation (coerceInt) ===");
+const RANGE = { min: 1, max: 100, fallback: 10 };
+const coerce = (v) => { try { return api.coerceInt(v, "n", RANGE); } catch { return "rejected"; } };
+check("undefined falls back to the default", coerce(undefined), 10);
+check("in-range number passes through", coerce(42), 42);
+check("numeric string accepted", coerce("42"), 42);
+check("float truncated", coerce(42.9), 42);
+check("above max clamped", coerce(5000), 100);
+check("below min clamped", coerce(-5), 1);
+check("non-numeric string rejected (no NaN reaches SQL)", coerce("10; DROP TABLE Users"), "rejected");
+check("NaN rejected", coerce(NaN), "rejected");
+check("Infinity rejected", coerce(Infinity), "rejected");
+check("object rejected", coerce({}), "rejected");
+
+console.log("\n=== G. Driver error text is not echoed verbatim ===");
+const longMsg = "Invalid object name 'dbo.SecretTable'. " + "x".repeat(500);
+const multiline = Object.assign(new Error("first line\nleaks the failing statement"), { number: 208 });
+check("multi-line driver error collapsed to first line",
+  api.describeError(multiline), "first line [SQL error 208]");
+check("long message truncated", api.describeError(new Error(longMsg)).length <= 330, true);
+check("truncation is marked", api.describeError(new Error(longMsg)).includes("(truncated)"), true);
+
+console.log("\n=== H. Result paging is streamed, not buffered (DoS) ===");
+// The audit trail goes to stderr via console.error; capture it here so the
+// test output stays readable and section I can assert on what was logged.
+const auditLines = [];
+const realConsoleError = console.error;
+console.error = (...parts) => auditLines.push(parts.join(" "));
+
+async function runQuery(rowCount, args) {
+  fakeDb.rows = Array.from({ length: rowCount }, (_, i) => ({ id: i + 1, name: `row${i + 1}` }));
+  fakeDb.emitted = 0;
+  return JSON.parse(
+    await api.handleMssqlQuery({ query: "SELECT * FROM Users", response_format: "json", ...args })
+  );
+}
+
+const big = await runQuery(5000, { maxRows: 10 });
+check("page capped at maxRows", big.returnedRows, 10);
+check("hasMore reported", big.hasMore, true);
+check("total NOT claimed exact after an early stop", big.totalCountExact, false);
+check("stream cancelled instead of draining 5000 rows", fakeDb.emitted <= 20, true);
+check("page starts at row 1", big.rows[0].id, 1);
+
+const paged = await runQuery(5000, { maxRows: 5, offset: 20 });
+check("offset skips to the right row", paged.rows[0].id, 21);
+check("page window respects the offset", paged.rows[paged.rows.length - 1].id, 25);
+
+const small = await runQuery(3, { maxRows: 10 });
+check("short result set reports an exact total", small.totalCount, 3);
+check("short result set marked exact", small.totalCountExact, true);
+check("no phantom next page", small.hasMore, false);
+
+const beyond = await runQuery(3, { maxRows: 10, offset: 100 });
+check("offset past the end returns no rows", beyond.returnedRows, 0);
+
+const badMaxRows = await runQuery(3, { maxRows: "1 OR 1=1" }).then(() => "accepted", () => "rejected");
+check("non-numeric maxRows rejected", badMaxRows, "rejected");
+
+console.log("\n=== I. Query audit trail ===");
+auditLines.length = 0;
+const longQuery = `SELECT '${"a".repeat(700)}' AS padding FROM Users`;
+await runQuery(3, { query: longQuery });
+console.error = realConsoleError;
+
+const auditEntries = auditLines
+  .filter((l) => l.includes("[mssql-mcp][audit]"))
+  .map((l) => JSON.parse(l.slice(l.indexOf("{"))));
+const queryEntry = auditEntries.find((e) => e.event === "query");
+check("every query is audited", Boolean(queryEntry), true);
+check("audit records the mode", queryEntry?.mode, "read-only");
+check("audit records rows returned", queryEntry?.returnedRows, 3);
+check("audit timestamps the call", typeof queryEntry?.ts === "string", true);
+check("audited query text is truncated", queryEntry?.query.includes("[+"), true);
+check("audit line is a single line of JSON", queryEntry?.query.includes("\n"), false);
 
 console.log(`\n========== RESULT: ${pass} passed, ${fail} failed ==========`);
 if (failures.length) {

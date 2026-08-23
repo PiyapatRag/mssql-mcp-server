@@ -121,6 +121,88 @@ const config: sql.config = {
 // Connection pool
 let pool: sql.ConnectionPool | null = null;
 
+// ---------------------------------------------------------------------------
+// Audit logging
+//
+// Every tool invocation is logged to STDERR as a single JSON line. stdout is
+// the MCP transport and must never be written to; stderr is what the MCP
+// client captures into its server log, so that is the audit sink.
+//
+// Query text is truncated and can be disabled entirely (MSSQL_AUDIT_LOG=false)
+// because a query may embed sensitive literals in its WHERE clause.
+// ---------------------------------------------------------------------------
+const AUDIT_LOG = (process.env.MSSQL_AUDIT_LOG ?? "true").trim().toLowerCase() !== "false";
+const AUDIT_QUERY_MAX_CHARS = 500;
+
+function truncateForLog(text: string, max = AUDIT_QUERY_MAX_CHARS): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…[+${oneLine.length - max} chars]` : oneLine;
+}
+
+function auditLog(entry: Record<string, unknown>): void {
+  if (!AUDIT_LOG) return;
+  try {
+    console.error(`[mssql-mcp][audit] ${JSON.stringify({ ts: new Date().toISOString(), ...entry })}`);
+  } catch {
+    // Logging must never be the reason a request fails.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Error reporting
+//
+// Driver errors carry server name, procedure name, line numbers and fragments
+// of the executed statement. Handing that back verbatim turns any failing
+// query into a schema/structure oracle, so the client gets a first-line,
+// length-capped message while the full error goes to the stderr log where the
+// operator (not the caller) can read it. MSSQL_VERBOSE_ERRORS=true opts out.
+// ---------------------------------------------------------------------------
+const VERBOSE_ERRORS = (process.env.MSSQL_VERBOSE_ERRORS ?? "false").trim().toLowerCase() === "true";
+const ERROR_MESSAGE_MAX_CHARS = 300;
+
+function describeError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (VERBOSE_ERRORS) return raw;
+
+  const firstLine = raw.split(/\r?\n/)[0].trim();
+  const clipped =
+    firstLine.length > ERROR_MESSAGE_MAX_CHARS
+      ? `${firstLine.slice(0, ERROR_MESSAGE_MAX_CHARS)}… (truncated)`
+      : firstLine;
+
+  // The SQL Server error number is a stable, non-revealing identifier that
+  // still lets the caller (and the operator reading the log) correlate.
+  const number = (error as { number?: unknown } | null)?.number;
+  return typeof number === "number" ? `${clipped} [SQL error ${number}]` : clipped;
+}
+
+// ---------------------------------------------------------------------------
+// Numeric tool arguments arrive as untyped JSON. A non-numeric value used to
+// pass straight through Math.floor() as NaN and reach the driver (or a TOP (n)
+// interpolation) as "NaN". Coerce and clamp in one place instead; only a value
+// that cannot be a number at all is rejected outright.
+// ---------------------------------------------------------------------------
+function coerceInt(
+  value: unknown,
+  name: string,
+  opts: { min: number; max: number; fallback: number }
+): number {
+  if (value === undefined || value === null) return opts.fallback;
+
+  const n =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+      ? Number(value)
+      : NaN;
+
+  if (!Number.isFinite(n)) {
+    throw new Error(`'${name}' must be a number (received ${JSON.stringify(value)}).`);
+  }
+
+  return Math.max(opts.min, Math.min(Math.trunc(n), opts.max));
+}
+
 // Statement-leading keywords that are permitted. This is an ALLOW-LIST:
 // a query is accepted only if its first significant keyword is one of these.
 // Allow-listing the read-only entry points avoids the false positives a
@@ -1147,9 +1229,85 @@ async function assertExecProcIsReadOnly(procName: string): Promise<void> {
   }
 }
 
+// One page of a streamed result set.
+type QueryPage = {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  scanned: number; // rows observed in the first recordset before we stopped
+  hasMore: boolean;
+  totalKnown: boolean; // false when we cancelled before the end of the set
+};
+
+// Read a query's first recordset in STREAMING mode, keeping only the requested
+// page in memory.
+//
+// The previous implementation awaited the whole recordset and then sliced it,
+// so `SELECT * FROM HugeTable` buffered every row into the server process
+// before maxRows was ever applied — a query that is perfectly legal under the
+// read-only allow-list could exhaust the heap. Streaming bounds memory to
+// `limit` rows regardless of how large the result set is, and cancelling one
+// row past the window stops the server from shipping the rest over the wire.
+//
+// Only the FIRST recordset is returned, matching the previous
+// `result.recordset` behaviour for DECLARE/INSERT batches.
+async function streamQueryPage(query: string, offset: number, limit: number): Promise<QueryPage> {
+  const dbPool = await getPool();
+  const request = dbPool.request();
+  request.stream = true;
+
+  const rows: Record<string, unknown>[] = [];
+  let columns: string[] = [];
+  let recordsetIndex = -1;
+  let scanned = 0;
+  let hasMore = false;
+  let stoppedEarly = false;
+  let streamError: Error | null = null;
+
+  request.on("recordset", (cols: Record<string, unknown>) => {
+    recordsetIndex += 1;
+    if (recordsetIndex === 0) columns = Object.keys(cols ?? {});
+  });
+
+  request.on("row", (row: Record<string, unknown>) => {
+    if (recordsetIndex !== 0 || stoppedEarly) return;
+
+    scanned += 1;
+    if (scanned <= offset) return; // still skipping to the start of the page
+    if (rows.length < limit) {
+      rows.push(row);
+      return;
+    }
+
+    // One row beyond the page window: that is all we need to report hasMore.
+    // Cancel rather than drain — cancellation is asynchronous, so the
+    // stoppedEarly guard above drops any rows still in flight.
+    hasMore = true;
+    stoppedEarly = true;
+    request.cancel();
+  });
+
+  // In stream mode the driver EMITS errors instead of rejecting the promise,
+  // so an unhandled 'error' event would otherwise crash the process.
+  request.on("error", (err: Error) => {
+    if (!streamError) streamError = err;
+  });
+
+  await request.query(query);
+
+  // A cancel surfaces here as an error too; that one is expected and ignored.
+  if (streamError && !stoppedEarly) throw streamError;
+
+  return { columns, rows, scanned, hasMore, totalKnown: !stoppedEarly };
+}
+
 async function handleMssqlQuery(args: QueryArgs): Promise<string> {
-  const { query, maxRows = 100, offset = 0, response_format = "json" } = args;
-  const limit = Math.min(maxRows, 1000);
+  const { query, response_format = "json" } = args;
+  const limit = coerceInt(args.maxRows, "maxRows", { min: 1, max: 1000, fallback: 100 });
+  const offset = coerceInt(args.offset, "offset", { min: 0, max: 10_000_000, fallback: 0 });
+
+  if (typeof query !== "string" || query.trim() === "") {
+    throw new Error("'query' is required and must be a non-empty string.");
+  }
 
   // Server-level dangerous statements are blocked in BOTH modes.
   const dangerous = findDangerousStatement(query);
@@ -1171,32 +1329,57 @@ async function handleMssqlQuery(args: QueryArgs): Promise<string> {
     }
   }
 
-  const dbPool = await getPool();
-  const result = await dbPool.request().query(query);
+  const started = Date.now();
+  const { columns, rows: page, scanned, hasMore, totalKnown } = await streamQueryPage(
+    query,
+    offset,
+    limit
+  );
 
-  const allRows = result.recordset ?? [];
-  const totalCount = allRows.length;
-  const page = allRows.slice(offset, offset + limit);
-  const hasMore = offset + limit < totalCount;
+  auditLog({
+    event: "query",
+    tool: "mssql_query",
+    mode: READ_ONLY ? "read-only" : "write",
+    query: truncateForLog(query),
+    offset,
+    limit,
+    returnedRows: page.length,
+    scannedRows: scanned,
+    truncated: !totalKnown,
+    durationMs: Date.now() - started,
+  });
+
+  // totalCount is only reported when the whole set was actually read; after an
+  // early cancel we know the page and that more exist, not the true total.
+  const totalCount = totalKnown ? scanned : null;
 
   if (response_format === "markdown") {
-    if (page.length === 0) return "_No rows returned._";
-    const columns = Object.keys(page[0]);
-    const header = `| ${columns.join(" | ")} |`;
-    const separator = `| ${columns.map(() => "---").join(" | ")} |`;
-    const rows = page.map((row) => `| ${columns.map((c) => String(row[c] ?? "")).join(" | ")} |`);
-    const meta = `\n_Showing rows ${offset + 1}–${offset + page.length} of ${totalCount}${hasMore ? " (more available)" : ""}_`;
+    if (page.length === 0) {
+      return scanned > 0
+        ? `_No rows at offset ${offset} (result set has ${scanned} row${scanned === 1 ? "" : "s"})._`
+        : "_No rows returned._";
+    }
+    const cols = columns.length > 0 ? columns : Object.keys(page[0]);
+    const header = `| ${cols.join(" | ")} |`;
+    const separator = `| ${cols.map(() => "---").join(" | ")} |`;
+    const rows = page.map((row) => `| ${cols.map((c) => String(row[c] ?? "")).join(" | ")} |`);
+    const range = `${offset + 1}–${offset + page.length}`;
+    const meta = totalKnown
+      ? `\n_Showing rows ${range} of ${totalCount}${hasMore ? " (more available)" : ""}_`
+      : `\n_Showing rows ${range}; more rows available (total not counted — the result set was not read to the end)._`;
     return [header, separator, ...rows, meta].join("\n");
   }
 
   return JSON.stringify(
     {
       totalCount,
+      totalCountExact: totalKnown,
+      scannedRows: scanned,
       returnedRows: page.length,
       offset,
       hasMore,
       nextOffset: hasMore ? offset + limit : null,
-      columns: Object.keys(page[0] ?? {}),
+      columns: columns.length > 0 ? columns : Object.keys(page[0] ?? {}),
       rows: page,
     },
     null,
@@ -1475,7 +1658,8 @@ async function handleMssqlMonitorLocks(args: MonitorLocksArgs): Promise<string> 
 }
 
 async function handleMssqlMonitorUsage(args: MonitorUsageArgs): Promise<string> {
-  const { topQueries = 10, response_format = "markdown" } = args;
+  const { response_format = "markdown" } = args;
+  const topQueries = coerceInt(args.topQueries, "topQueries", { min: 1, max: 100, fallback: 10 });
   const dbPool = await getPool();
 
   const statsQuery = `
@@ -1689,8 +1873,8 @@ async function handleListTables(args: ListTablesArgs): Promise<string> {
 }
 
 async function handleSampleData(args: SampleDataArgs): Promise<string> {
-  const { tableName, rows = 10, response_format = "markdown" } = args;
-  const top = Math.max(1, Math.min(Math.floor(rows), 100));
+  const { tableName, response_format = "markdown" } = args;
+  const top = coerceInt(args.rows, "rows", { min: 1, max: 100, fallback: 10 });
   const quoted = quoteTableName(tableName);
 
   const dbPool = await getPool();
@@ -1867,8 +2051,8 @@ async function handleAnalyzeIndexes(args: AnalyzeIndexesArgs): Promise<string> {
 }
 
 async function handleAnalyzeStorage(args: AnalyzeStorageArgs): Promise<string> {
-  const { topTables = 20, response_format = "markdown" } = args;
-  const top = Math.max(1, Math.min(Math.floor(topTables), 200));
+  const { response_format = "markdown" } = args;
+  const top = coerceInt(args.topTables, "topTables", { min: 1, max: 200, fallback: 20 });
   const dbPool = await getPool();
 
   const tablesQuery = `
@@ -2026,8 +2210,12 @@ function supportsOnlineRebuild(editionClass: EditionClass): boolean {
 }
 
 async function handleIndexFragmentation(args: IndexFragmentationArgs): Promise<string> {
-  const { tableName, minPageCount = 100, response_format = "markdown" } = args;
-  const minPages = Math.max(1, Math.floor(minPageCount));
+  const { tableName, response_format = "markdown" } = args;
+  const minPages = coerceInt(args.minPageCount, "minPageCount", {
+    min: 1,
+    max: 1_000_000_000,
+    fallback: 100,
+  });
   const dbPool = await getPool();
   const version = await getServerVersionInfo();
 
@@ -2129,12 +2317,12 @@ const TOP_QUERY_METRICS: Map<string, { column: string; label: string }> = new Ma
 ]);
 
 async function handleTopQueries(args: TopQueriesArgs): Promise<string> {
-  const { metric = "cpu", top = 10, response_format = "markdown" } = args;
+  const { metric = "cpu", response_format = "markdown" } = args;
   const metricDef = TOP_QUERY_METRICS.get(metric);
   if (!metricDef) {
     throw new Error(`Unknown metric '${metric}'. Use one of: ${Array.from(TOP_QUERY_METRICS.keys()).join(", ")}.`);
   }
-  const limit = Math.max(1, Math.min(Math.floor(top), 50));
+  const limit = coerceInt(args.top, "top", { min: 1, max: 50, fallback: 10 });
   const dbPool = await getPool();
 
   const result = await dbPool.request().input("top", sql.Int, limit).query(`
@@ -2489,8 +2677,8 @@ function summarizeDeadlockXml(xml: string): {
 }
 
 async function handleGetDeadlocks(args: GetDeadlocksArgs): Promise<string> {
-  const { maxEvents = 5, source = "ring_buffer", response_format = "markdown" } = args;
-  const max = Math.max(1, Math.min(Math.floor(maxEvents), 25));
+  const { source = "ring_buffer", response_format = "markdown" } = args;
+  const max = coerceInt(args.maxEvents, "maxEvents", { min: 1, max: 25, fallback: 5 });
   const dbPool = await getPool();
   const version = await getServerVersionInfo();
 
@@ -2604,6 +2792,9 @@ async function main() {
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const toolName = request.params.name;
+    const startedAt = Date.now();
+    let failed = false;
     try {
       const { name, arguments: args } = request.params;
 
@@ -2707,11 +2898,34 @@ async function main() {
           throw new Error(`Unknown tool: ${name}`);
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
+      failed = true;
+      // Full detail (stack, driver metadata) goes to the operator's log only;
+      // the caller gets the sanitized form. See describeError().
+      auditLog({
+        event: "call",
+        tool: toolName,
+        outcome: "error",
+        durationMs: Date.now() - startedAt,
+        error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      });
+      if (!AUDIT_LOG) {
+        console.error(`[mssql-mcp] ${toolName} failed:`, error);
+      }
       return {
-        content: [{ type: "text", text: `Error: ${errorMessage}` }],
+        content: [{ type: "text", text: `Error: ${describeError(error)}` }],
         isError: true,
       };
+    } finally {
+      // Runs after the successful `return` inside the switch above, so every
+      // invocation leaves exactly one outcome line in the audit trail.
+      if (!failed) {
+        auditLog({
+          event: "call",
+          tool: toolName,
+          outcome: "ok",
+          durationMs: Date.now() - startedAt,
+        });
+      }
     }
   });
 
