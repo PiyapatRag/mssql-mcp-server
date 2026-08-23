@@ -36,6 +36,8 @@ coverage/
 # Production
 *.pem
 *.key
-.claude
 
+# Claude Code local workspace (subagents, scripts, API keys, generated reports)
+.claude
+.claude/
 security-review

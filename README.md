@@ -174,7 +174,9 @@ regardless of mode:
 `CREATE/ALTER/DROP LOGIN/USER/CREDENTIAL/CERTIFICATE`, `ALTER SERVER`,
 `ALTER SERVER ROLE`/`ALTER ROLE`, `sp_addrolemember`/`sp_addsrvrolemember`/
 `sp_droprolemember`, `sp_addlinkedserver`, `EXECUTE AS`, `sp_executesql`,
-`GRANT`/`DENY`/`REVOKE`, `OPENROWSET`/`OPENDATASOURCE`/`OPENQUERY`.
+`GRANT`/`DENY`/`REVOKE`, `OPENROWSET`/`OPENDATASOURCE`/`OPENQUERY`, and the
+server-side file readers `fn_get_audit_file`, `fn_xe_file_target_read_file`,
+`fn_trace_gettable`, `sp_readerrorlog`/`xp_readerrorlog`.
 
 > ⚠️ Use write mode only with a SQL login whose own permissions are equally
 > limited — the database login remains the primary security boundary.

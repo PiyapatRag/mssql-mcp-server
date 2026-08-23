@@ -288,12 +288,31 @@ function scanSql(text: string): SqlToken[] {
   return tokens;
 }
 
+// Characters SQL Server's tokenizer treats as a separator between keywords but
+// that JavaScript's \s does NOT match, so `KEYWORD​KEYWORD` would reach the
+// analyzer as one token and slip past patterns like /BULK\s+INSERT/ or the
+// leading-keyword allow-list, while SQL Server still parses it as two keywords
+// and executes it. Confirmed live: `CREATE​LOGIN` and `DROP​DATABASE`
+// ran despite the guard. These are zero-width / format / unusual-space code
+// points; none belong inside a real SQL keyword. They are normalized to a plain
+// space in the ANALYSIS copy only (the executed query is never rewritten), so
+// the analyzer sees the same token boundaries the engine does — and only inside
+// plain text, never inside string literals or quoted/bracketed identifiers,
+// where such a code point could be legitimate data or part of a name.
+const INVISIBLE_SEPARATORS =
+  /[\u0085\u00A0\u180E\u1680\u2000-\u200D\u2028\u2029\u202F\u205F\u2060\u3000\uFEFF]/g;
+
+function neutralizeSeparators(text: string): string {
+  return text.replace(INVISIBLE_SEPARATORS, " ");
+}
+
 // Comments removed, everything else left verbatim (quotes included) — needed
 // where a caller must see the original quoting, e.g. detecting a leading
-// string/variable right after EXEC (dynamic SQL).
+// string/variable right after EXEC (dynamic SQL). Invisible separators in plain
+// text are normalized so a zero-width space cannot hide the leading keyword.
 function stripCommentsOnly(query: string): string {
   return scanSql(query)
-    .map((t) => (t.type === "comment" ? " " : t.value))
+    .map((t) => (t.type === "comment" ? " " : t.type === "text" ? neutralizeSeparators(t.value) : t.value))
     .join("");
 }
 
@@ -310,7 +329,8 @@ function sanitizeForAnalysis(query: string): string {
       if (t.type === "comment") return " ";
       if (t.type === "squote") return " '' ";
       if (t.type === "dquote") return `[${t.value.slice(1, -1).replace(/""/g, '"')}]`;
-      return t.value; // bracketed identifier or plain text — preserved
+      if (t.type === "text") return neutralizeSeparators(t.value); // collapse invisible separators
+      return t.value; // bracketed identifier — preserved verbatim
     })
     .join("");
 }
@@ -431,6 +451,25 @@ const DANGEROUS_STATEMENT_PATTERNS: Array<{ re: RegExp; label: string }> = [
   { re: /(?<![A-Z0-9_])XP_REG[A-Z]+(?![A-Z0-9_])/i, label: "registry access (xp_reg*)" },
   { re: /(?<![A-Z0-9_])XP_(?:DIRTREE|SUBDIRS|FILEEXIST|CREATESUBDIR|DELETESUBDIR)(?![A-Z0-9_])/i, label: "filesystem access (xp_dirtree / xp_fileexist / ...)" },
   { re: /(?<![A-Z0-9_])BULK\s+INSERT(?![A-Z0-9_])/i, label: "BULK INSERT (reads a server-side file)" },
+  // Built-in table-valued functions that read files off the server's disk.
+  // These are SELECT-shaped, so classifyQuery treats them as ordinary reads —
+  // but they hand the caller the contents of .xel / .sqlaudit / .trc files
+  // (and the error log), exactly the server-side file read OPENROWSET(BULK) is
+  // blocked for. A high-privilege login could otherwise exfiltrate them.
+  { re: /(?<![A-Z0-9_])FN_GET_AUDIT_FILE(?![A-Z0-9_])/i, label: "server-side file read (fn_get_audit_file)" },
+  { re: /(?<![A-Z0-9_])FN_XE_FILE_TARGET_READ_FILE(?![A-Z0-9_])/i, label: "server-side file read (fn_xe_file_target_read_file)" },
+  { re: /(?<![A-Z0-9_])FN_TRACE_GETTABLE(?![A-Z0-9_])/i, label: "server-side file read (fn_trace_gettable)" },
+  { re: /(?<![A-Z0-9_])(?:XP|SP)_READERRORLOG(?![A-Z0-9_])/i, label: "server error-log read (sp_readerrorlog / xp_readerrorlog)" },
+  // Transaction-log readers: fn_dump_dblog reads log-backup FILES off disk;
+  // fn_dblog reads the active log. Both leak data a read-only caller shouldn't
+  // see. (Bare or sys-qualified.)
+  { re: /(?<![A-Z0-9_])FN_(?:DUMP_)?DBLOG(?![A-Z0-9_])/i, label: "transaction-log read (fn_dblog / fn_dump_dblog)" },
+  // Defense-in-depth against the denylist being incomplete: any built-in
+  // sys.fn_* function whose name contains FILE is a server-side file reader
+  // (fn_read_file, fn_xe_file_target_read_file, fn_virtualfilestats, and any
+  // future variant). Anchored to the sys schema so a user function such as
+  // dbo.fn_myfile is unaffected.
+  { re: /(?<![A-Z0-9_])SYS\.FN_[A-Z0-9_]*FILE[A-Z0-9_]*(?![A-Z0-9_])/i, label: "server-side file read (sys.fn_*file* built-in)" },
 
   // --- instance configuration -----------------------------------------------
   { re: /(?<![A-Z0-9_])SP_CONFIGURE(?![A-Z0-9_])/i, label: "sp_configure" },
@@ -559,11 +598,48 @@ function classifyQuery(query: string): QueryClassification {
 }
 
 // Initialize connection pool
+//
+// A ConnectionPool is an EventEmitter: when a pooled connection drops (SQL
+// Server restarts, a failover, an idle socket reset, a network blip) it emits
+// 'error'. An 'error' event with no listener is re-thrown as an uncaught
+// exception, which would take the whole MCP server process down and force the
+// user to restart their MCP client. So the pool always gets an error listener,
+// and a pool that has failed is discarded so the next tool call reconnects
+// instead of reusing a dead one.
+let poolPromise: Promise<sql.ConnectionPool> | null = null;
+
+function discardPool(reason: string, current: sql.ConnectionPool | null): void {
+  // Only discard if this is still the pool in use — a late event from an
+  // already-replaced pool must not throw away a healthy new one.
+  if (current !== null && pool !== current) return;
+  pool = null;
+  poolPromise = null;
+  console.error(`[mssql-mcp] connection pool discarded (${reason}); next call will reconnect`);
+}
+
 async function getPool(): Promise<sql.ConnectionPool> {
-  if (!pool) {
-    pool = await sql.connect(config);
+  if (pool && pool.connected) return pool;
+  if (pool && !pool.connecting) discardPool("pool no longer connected", pool);
+
+  // Collapse concurrent first calls onto a single connect attempt.
+  if (!poolPromise) {
+    poolPromise = (async () => {
+      const created = new sql.ConnectionPool(config);
+      created.on("error", (err) => {
+        console.error(`[mssql-mcp] connection pool error: ${err instanceof Error ? err.message : String(err)}`);
+        discardPool("pool error", created);
+      });
+      await created.connect();
+      pool = created;
+      return created;
+    })().catch((err) => {
+      // A failed connect must not be cached, or every later call fails too.
+      pool = null;
+      poolPromise = null;
+      throw err;
+    });
   }
-  return pool;
+  return poolPromise;
 }
 
 // Typed interfaces for tool arguments
@@ -1628,8 +1704,9 @@ async function handleMssqlMonitorLocks(args: MonitorLocksArgs): Promise<string> 
       ON tl.request_session_id = er.session_id
     LEFT JOIN sys.dm_os_waiting_tasks wt
       ON tl.request_session_id = wt.session_id
-    LEFT JOIN sys.dm_exec_sql_text(er.sql_handle) st
-      ON 1=1
+    -- A table-valued function taking a column from another row source has to be
+    -- correlated with APPLY; a LEFT JOIN cannot bind er.sql_handle (error 4104).
+    OUTER APPLY sys.dm_exec_sql_text(er.sql_handle) st
     WHERE tl.request_session_id <> @@SPID
       AND es.is_user_process = 1
     ORDER BY wt.wait_duration_ms DESC, tl.request_session_id
@@ -2953,6 +3030,16 @@ async function main() {
   console.error(
     `MS SQL Server MCP Server running on stdio (mode: ${READ_ONLY ? "READ-ONLY" : "WRITE"}, server: ${config.server}, database: ${config.database || "(default)"})`
   );
+
+  if (!config.database) {
+    // Without an explicit database the login lands in its default one (usually
+    // master). That still connects, so the mistake is otherwise silent — and
+    // every schema/storage tool would then report on the wrong database.
+    console.error(
+      "[mssql-mcp] WARNING: MSSQL_DATABASE is not set. Connecting to the login's default database " +
+        "(typically master). Set MSSQL_DATABASE to the database you meant to query."
+    );
+  }
 }
 
 // Cleanup on exit

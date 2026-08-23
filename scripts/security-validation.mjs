@@ -51,11 +51,31 @@ class FakeRequest extends EventEmitter {
   }
 }
 
+// The real sql.ConnectionPool is an EventEmitter — getPool() subscribes to its
+// 'error' event so a dropped connection cannot crash the process — so the fake
+// has to be one too.
+class FakeConnectionPool extends EventEmitter {
+  constructor() {
+    super();
+    this.connected = false;
+    this.connecting = false;
+  }
+  async connect() {
+    this.connected = true;
+    return this;
+  }
+  request() { return new FakeRequest(); }
+  async close() { this.connected = false; }
+}
+
 // `__esModule` and `then` must read as absent: the compiled output runs the
 // module through __importDefault (which checks __esModule), and a truthy
 // `then` would make the module look like a thenable and hang the await.
 const fakeMssql = new Proxy(
-  { connect: async () => ({ request: () => new FakeRequest(), close: async () => {} }) },
+  {
+    ConnectionPool: FakeConnectionPool,
+    connect: async () => ({ request: () => new FakeRequest(), close: async () => {} }),
+  },
   {
     get: (t, p) => (p in t ? t[p] : p === "__esModule" || p === "then" ? undefined : dummy),
   }
@@ -133,14 +153,40 @@ check("keyword hidden in bracket identifier is fine", classify("SELECT [update] 
 
 console.log("\n=== C. Dangerous statements blocked in BOTH modes (findDangerousStatement) ===");
 const danger = (q) => api.findDangerousStatement(q) !== null;
+const writes = (q) => api.writesToPersistentTable(q);
 check("xp_cmdshell", danger("EXEC xp_cmdshell 'dir'"), true);
 check("sp_configure", danger("EXEC sp_configure 'show advanced', 1"), true);
 check("DROP DATABASE", danger("DROP DATABASE prod"), true);
 check("BACKUP DATABASE", danger("BACKUP DATABASE prod TO DISK='x'"), true);
 check("GRANT", danger("GRANT SELECT ON t TO u"), true);
 check("OPENROWSET", danger("SELECT * FROM OPENROWSET('SQLOLEDB','x';'y';'z','SELECT 1')"), true);
+// Built-in file-reading TVFs are SELECT-shaped, so they must be caught by the
+// dangerous-statement list, not the write analyzer.
+check("fn_get_audit_file", danger("SELECT * FROM sys.fn_get_audit_file('C:\\*.sqlaudit', DEFAULT, DEFAULT)"), true);
+check("fn_xe_file_target_read_file", danger("SELECT * FROM sys.fn_xe_file_target_read_file('x*.xel', NULL, NULL, NULL)"), true);
+check("fn_trace_gettable", danger("SELECT * FROM sys.fn_trace_gettable('C:\\x.trc', 1)"), true);
+check("sp_readerrorlog", danger("EXEC sys.sp_readerrorlog 0"), true);
+check("column named 'fn_get_audit_file_path' does NOT false-positive", danger("SELECT fn_get_audit_file_path FROM t"), false);
+// Denylist completeness (Qwen red-team follow-up): transaction-log readers and
+// any sys.fn_*file* built-in, incl. names the model probed that don't exist yet.
+check("fn_dblog", danger("SELECT * FROM sys.fn_dblog(NULL, NULL)"), true);
+check("fn_dump_dblog", danger("SELECT * FROM sys.fn_dump_dblog(NULL,NULL,NULL,NULL,'C:\\l.bak')"), true);
+check("sys.fn_read_file", danger("SELECT * FROM sys.fn_read_file('C:\\x')"), true);
+check("sys.fn_read_file + trailing WHERE", danger("SELECT * FROM sys.fn_read_file('C:\\x') WHERE 1=1"), true);
+check("sys.fn_virtualfilestats (broad sys.fn_*file*)", danger("SELECT * FROM sys.fn_virtualfilestats(NULL,NULL)"), true);
+check("user fn dbo.fn_myfile does NOT false-positive", danger("SELECT * FROM dbo.fn_myfile(1)"), false);
 check("SHUTDOWN", danger("SHUTDOWN"), true);
 check("KILL", danger("KILL 55"), true);
+// Zero-width / format code points that SQL Server treats as a token separator
+// but JS \s does not: without normalization, `CREATE\u200BLOGIN` slipped past
+// the guard and actually ran (confirmed live). The analyzer must collapse them.
+check("ZWSP splits CREATE LOGIN", danger("CREATE\u200BLOGIN hax WITH PASSWORD='x'"), true);
+check("ZWSP splits DROP DATABASE", danger("DROP\u200BDATABASE prod"), true);
+check("ZWSP splits BULK INSERT", danger("BULK\u200BINSERT t FROM 'C:\\x'"), true);
+check("ZWJ splits GRANT", danger("GRANT\u200DSELECT ON t TO u"), true);
+check("word-joiner splits xp_cmdshell", danger("EXEC\u2060xp_cmdshell 'dir'"), true);
+check("ZWSP write target caught by analyzer", writes("WITH x AS(SELECT 1 n) UPDATE\u200Bdbo.Users SET a=1"), true);
+check("ZWSP does NOT false-positive a plain select", danger("SELECT\u200Bcol FROM t"), false);
 check("hidden in literal does NOT false-positive", danger("SELECT * FROM t WHERE x = 'xp_cmdshell'"), false);
 check("column named 'shutdown_ts' does NOT false-positive", danger("SELECT shutdown_ts FROM t"), false);
 check("EXEC(<string>) dynamic SQL blocked pre-classify", danger("EXEC('SELECT 1')"), true);
