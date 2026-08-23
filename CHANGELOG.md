@@ -21,7 +21,7 @@ guard bypasses**, and two follow-up source-review findings (string-literal /
 dynamic-`EXEC` obfuscation, and a `#` in `quoteTableName`) were verified **not
 exploitable** against the live instance. The least-privilege database login
 remains the primary control; the application guard is defense-in-depth. Full
-detail in [SECURITY_REVIEW.md](SECURITY_REVIEW.md) Part 6. Test suites:
+detail in [SECURITY_REVIEW.md](SECURITY_REVIEW.md) Part 5. Test suites:
 security-validation 117/117, live pentest 59/59, functional e2e 105/105.
 
 ### Security
@@ -35,7 +35,7 @@ security-validation 117/117, live pentest 59/59, functional e2e 105/105.
   the `sys` schema so user functions like `dbo.fn_myfile` are unaffected. No
   payload from the run was exploitable as written (the model's `sys.fn_read_file`
   hits used a non-existent function), but the class-level gap is now closed as
-  defense-in-depth. See [qwen-pentest-remediation.md](qwen-pentest-remediation.md).
+  defense-in-depth. See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) Part 5.
 
 - **Closed a zero-width-character guard bypass (high).** SQL Server's tokenizer
   treats several zero-width / format code points (`U+200B` ZWSP, `U+200C`,

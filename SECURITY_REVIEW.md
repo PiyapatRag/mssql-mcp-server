@@ -7,10 +7,10 @@ Supersedes `SECURITY_AUDIT.md`, the four working files that lived in
 `security-review/` (`deail.md`, `VULNERABILITY_REPORT.md`, `ADVISORY_DRAFT.md`,
 `reply-to-reporter.md`), and the standalone model-review files
 `qwen3.8-reviewed.md`, `qwen3.8-reviewed.json`, and `qwen-pentest-remediation.md`
-(all folded into Part 6).
+(all folded into Part 5).
 
 > **Status:** all findings closed. The v2.0.2 fix (Part 0 root cause) shipped;
-> Part 6 records a later round (model-assisted review + live testing against a
+> Part 5 records a later round (model-assisted review + live testing against a
 > real SQL Server 2025 instance) that found and fixed additional issues, still
 > unreleased at time of writing. The advisory in Part 4 is a **DRAFT** — publish
 > it only after 2.0.2 is on npm.
@@ -21,8 +21,7 @@ Supersedes `SECURITY_AUDIT.md`, the four working files that lived in
 2. Part 2 — Initial contact from the reporter
 3. Part 3 — Full vulnerability report (as submitted)
 4. Part 4 — GitHub Security Advisory (draft)
-5. Part 5 — Draft reply to the reporter
-6. Part 6 — Model-assisted review & live red-team (round 4, 2026-08-23)
+5. Part 5 — Model-assisted review & live red-team (round 4, 2026-08-23)
 
 **At a glance**
 
@@ -118,7 +117,7 @@ Sound design: **read-only by default**, an **allow-list** SQL analyzer as defens
 
 1. Enable **private vulnerability reporting** on GitHub (Settings → Code security)
 2. Bump to **2.0.2** and `npm publish` — v2.0.1 on npm still carries the critical vulnerability
-3. Publish the GitHub Security Advisory and reply to the researcher — both drafted below in Parts 4 and 5
+3. Publish the GitHub Security Advisory and reply to the researcher — the advisory is drafted below in Part 4
 
 ---
 *Limitation: no real SQL Server was available for testing — DB-level enforcement (db_denydatawriter, EXECUTE grants) was reviewed statically only*
@@ -501,106 +500,10 @@ bypass to a failed statement at the database boundary.
 
 ---
 
-# Part 5 — Draft reply to the reporter
-
-Send from the address they contacted (the npm maintainer contact), subject:
-`Re: Critical vulnerability in @piyapat/mssql-mcp-server 2.0.1`.
-
-**Before sending, check:** the two dates/claims below are written as if 2.0.2 is
-about to ship. If you send this before publishing, say "the fix is committed and
-2.0.2 goes out shortly" instead of naming a version as released.
-
----
-
-Hi Kietgboiz17,
-
-Thank you — this is a genuinely good report, and you are right on every point.
-I have reproduced both PoCs, confirmed the root cause is exactly the
-parsing-order issue you identified, and fixed it.
-
-**What was wrong.** `stripComments()` ran ahead of `stripStringLiterals()` and
-had no concept of quote state, so a `--` inside a closed same-line literal
-blanked the rest of the line — the `;` and the statement after it — from the
-analyzer's copy while the original text went to the driver untouched. All three
-guards (stacked-statement check, persistent-write detector, dangerous-statement
-list) shared that one flaw.
-
-**The fix.** I went slightly further than the reordering you suggested. Rather
-than keeping two passes and fixing their order, the cleaning is now a single
-left-to-right tokenizer (`scanSql`) that tracks quote state: a token that opens
-a string, a `"quoted identifier"`, or a `[bracketed identifier]` consumes its
-own closing delimiter before the scanner looks for anything inside it, so no
-comment marker or separator can ever be read out of a literal. Two views are
-derived from that one scan — one with comments removed and quoting intact, one
-fully sanitized for keyword/target analysis. Reordering the two regex passes
-would have closed your exact payload; a single scan closes the class.
-
-Reviewing around it turned up a few more things worth fixing in the same
-release:
-
-- `"Users"` quoted identifiers were being blanked as if they were string
-  literals, which hid the write target in `UPDATE "Users" SET …` under
-  `QUOTED_IDENTIFIER ON` — they are now normalized to bracket form before
-  analysis
-- `##global` temp tables were treated as session-local; they are persistent and
-  are now treated as such
-- The always-blocked list was missing `ALTER ROLE`, `sp_add(srv)rolemember`,
-  `sp_OA*`, `sp_executesql`, `OPENQUERY`, `sp_addlinkedserver`, `EXECUTE AS`,
-  `xp_dirtree`, `xp_fileexist`, `BULK INSERT`, `CREATE ASSEMBLY`, and `xp_regread`
-- Unrelated to your finding, but found in the same pass: results were fully
-  buffered in memory before pagination, so one large `SELECT` could exhaust the
-  process heap. Rows are now streamed and the read is cancelled one row past the
-  requested page.
-
-**Regression coverage.** Your PoC harness approach — extracting the real guard
-functions and firing at them — was the right shape, so I built it into the
-repository: `scripts/security-validation.mjs` loads the analyzer out of the
-compiled `build/index.js` and runs an attack battery against it, including your
-two payloads and their negative controls. It runs in CI on every push, so a
-future change that reintroduces this class of bug fails the build. Both of your
-payloads are now rejected:
-
-```
-SELECT 'x--' ; UPDATE Users SET Password='pwned' WHERE Id=1
-  findDangerousStatement -> null
-  classifyQuery          -> rejected: multiple statements (';') are not allowed
-
-SELECT 'x--' ; EXEC xp_cmdshell 'whoami'
-  findDangerousStatement -> xp_cmdshell
-  classifyQuery          -> rejected: multiple statements (';') are not allowed
-```
-
-**Release and disclosure.** The fix ships as 2.0.2, affected range
-`>= 1.0.0, <= 2.0.1`. I have enabled private vulnerability reporting on the
-repository — thank you for flagging that it was off — and added a `SECURITY.md`
-so the next person has a documented channel. I would like to publish a GitHub
-Security Advisory with the fix and credit you as the reporter; please let me
-know the name or handle you would like used, or if you would rather not be
-credited.
-
-On severity: I am publishing at High (8.1) rather than Critical (9.1). The
-data-integrity impact is exactly as you describe and needs no preconditions
-beyond the documented default; I am scoring availability as None because the
-`xp_cmdshell` RCE path additionally requires a SQL login with rights the project
-documents against and ships a least-privilege script to avoid. That is a
-narrow disagreement about one metric, not about the finding — if you think the
-reasoning is wrong, say so and I will reconsider before publishing.
-
-You offered to verify a patch against your PoC — I would welcome that. Happy to
-send you the diff, or point you at the commit, whichever you prefer.
-
-Thanks again for reporting this properly and privately, and for a write-up that
-made the root cause unambiguous.
-
-Best regards,
-Piyapat
-
----
-
-# Part 6 — Model-assisted review & live red-team (round 4, 2026-08-23)
+# Part 5 — Model-assisted review & live red-team (round 4, 2026-08-23)
 
 After the v2.0.2 fix, the guard was put through a second, tougher round: the
-self-hosted **Qwen 3.8** model (`qwen3.8-27b` @ a self-hosted vLLM endpoint)
+self-hosted **Qwen 3.8** model (`qwen3.8-27b`, self-hosted vLLM endpoint)
 was run both as a **source-code reviewer** and as an **SQL-guard red-teamer**,
 and — for the first time — every claim was verified by **executing payloads
 against a live SQL Server 2025 (17.0.1000.7) instance** through the real MCP
@@ -612,19 +515,19 @@ any change was made. This part folds in the three former standalone files
 (`qwen3.8-reviewed.md`, `qwen-pentest-remediation.md`, and the raw
 `qwen3.8-reviewed.json`, appended at the end).
 
-## 6.1 Outcome at a glance
+## 5.1 Outcome at a glance
 
 | # | Source | Finding | Verified verdict | Action |
 |---|--------|---------|------------------|--------|
-| 6-A | Qwen review | Zero-width / Unicode-separator guard bypass | **CONFIRMED — High. Created a login and dropped a database live.** | Fixed (`neutralizeSeparators`) |
-| 6-B | Qwen review | `MSSQL_TRUST_CERT` opt-in enables MITM | **Not a defect** — default is secure, opt-in is required for local/dev | No change (documented) |
-| 6-C | Qwen red-team | 5 raw "bypasses" out of 44 payloads | **0 exploitable as written** (3–5 used a non-existent function) | Denylist widened as defense-in-depth |
-| 6-D | Direct testing | Server-side file-read TVFs slip past as plain reads | **CONFIRMED — defense-in-depth gap** (live `.xel` data returned) | Fixed + widened to a class |
-| 6-E | Direct testing | Process crash when a DB connection drops | **CONFIRMED** — unhandled pool `'error'` killed the process | Fixed (`getPool`) |
-| 6-F | Direct testing | `mssql_monitor_locks` fails on every call | **CONFIRMED** — correlated TVF in a `LEFT JOIN` (error 4104) | Fixed (`OUTER APPLY`) |
-| 6-G | Direct testing | Silent wrong-database connection when `MSSQL_DATABASE` unset | **CONFIRMED** — connected to `master` silently | Fixed (startup warning) |
+| 5-A | Qwen review | Zero-width / Unicode-separator guard bypass | **CONFIRMED — High. Created a login and dropped a database live.** | Fixed (`neutralizeSeparators`) |
+| 5-B | Qwen review | `MSSQL_TRUST_CERT` opt-in enables MITM | **Not a defect** — default is secure, opt-in is required for local/dev | No change (documented) |
+| 5-C | Qwen red-team | 5 raw "bypasses" out of 44 payloads | **0 exploitable as written** (3–5 used a non-existent function) | Denylist widened as defense-in-depth |
+| 5-D | Direct testing | Server-side file-read TVFs slip past as plain reads | **CONFIRMED — defense-in-depth gap** (live `.xel` data returned) | Fixed + widened to a class |
+| 5-E | Direct testing | Process crash when a DB connection drops | **CONFIRMED** — unhandled pool `'error'` killed the process | Fixed (`getPool`) |
+| 5-F | Direct testing | `mssql_monitor_locks` fails on every call | **CONFIRMED** — correlated TVF in a `LEFT JOIN` (error 4104) | Fixed (`OUTER APPLY`) |
+| 5-G | Direct testing | Silent wrong-database connection when `MSSQL_DATABASE` unset | **CONFIRMED** — connected to `master` silently | Fixed (startup warning) |
 
-## 6.2 Finding 6-A — Zero-width / Unicode-separator guard bypass (High, FIXED)
+## 5.2 Finding 5-A — Zero-width / Unicode-separator guard bypass (High, FIXED)
 
 **Reported by:** the Qwen source-code review (as CWE-185, "Bypass of dangerous
 statement detection via Unicode whitespace normalization").
@@ -671,7 +574,7 @@ write-mode and 4 read-only ZWSP payloads are now blocked (12/12), legitimate
 queries with ordinary spaces still run, and 7 permanent regression cases were
 added to `scripts/security-validation.mjs`.
 
-## 6.3 Finding 6-B — `MSSQL_TRUST_CERT` opt-in — NOT A VULNERABILITY
+## 5.3 Finding 5-B — `MSSQL_TRUST_CERT` opt-in — NOT A VULNERABILITY
 
 The Qwen review flagged `trustServerCertificate: process.env.MSSQL_TRUST_CERT ===
 "true"` (CWE-295). The default is already secure: `trustServerCertificate` is
@@ -682,7 +585,7 @@ legitimate local/dev instances with no CA-issued cert (exactly the test box), an
 the README already warns to keep it off in production. Removing it would break
 supported setups. No code change — a deployment choice, not a flaw.
 
-## 6.4 Finding 6-C — Red-team payload battery (44 payloads, 0 exploitable)
+## 5.4 Finding 5-C — Red-team payload battery (44 payloads, 0 exploitable)
 
 The Qwen red-teamer fired 44 SQL-guard bypass payloads. Its harness flags a
 payload as a bypass when the classifier allows it and `findDangerousStatement`
@@ -697,9 +600,9 @@ was verified by hand:
 
 **Net: 0 payloads were exploitable as written.** The guard plus the primary
 `db_datareader + db_denydatawriter` login boundary held. Finding 3–5 nonetheless
-pointed at a genuine defense-in-depth weakness, closed under 6-D.
+pointed at a genuine defense-in-depth weakness, closed under 5-D.
 
-## 6.5 Finding 6-D — Server-side file-read denylist widened from a list to a class
+## 5.5 Finding 5-D — Server-side file-read denylist widened from a list to a class
 
 Direct testing during this round confirmed the *real* version of what the
 red-teamer only gestured at: several **built-in** file-reading table-valued
@@ -726,11 +629,11 @@ are blocked; and there are no false positives — a user TVF
 (`sales.tvf_CustomerOrders(1)`) still runs, a column named `fn_get_audit_file_path`
 still selects, and `dbo.fn_myfile(1)` is not flagged.
 
-## 6.6 Findings 6-E / 6-F / 6-G — reliability & correctness fixes (from live runs)
+## 5.6 Findings 5-E / 5-F / 5-G — reliability & correctness fixes (from live runs)
 
 Found by running all 19 tools against the live instance, not by the model:
 
-- **6-E — Process crash on a dropped DB connection.** `sql.ConnectionPool` is an
+- **5-E — Process crash on a dropped DB connection.** `sql.ConnectionPool` is an
   `EventEmitter` and emits `'error'` when a pooled connection is lost (server
   restart, failover, idle-socket reset, network blip). Nothing listened for it,
   so Node re-threw it as an uncaught exception and the whole MCP server process
@@ -738,17 +641,17 @@ Found by running all 19 tools against the live instance, not by the model:
   process 13 times. `getPool` now attaches an error listener, discards a failed
   pool so the next call reconnects, and collapses concurrent first calls onto one
   connect attempt.
-- **6-F — `mssql_monitor_locks` failed on every call.** The query joined a
+- **5-F — `mssql_monitor_locks` failed on every call.** The query joined a
   table-valued function to a correlated column
   (`LEFT JOIN sys.dm_exec_sql_text(er.sql_handle) … ON 1=1`), which SQL Server
   rejects with error 4104 ("multi-part identifier could not be bound"). A
   correlated TVF must use `APPLY`; changed to `OUTER APPLY`.
-- **6-G — Silent wrong-database connection.** With `MSSQL_DATABASE` unset the
+- **5-G — Silent wrong-database connection.** With `MSSQL_DATABASE` unset the
   login connected to its default database (usually `master`) silently, so every
   schema/storage tool reported on the wrong database. The server now warns on
   stderr at startup.
 
-## 6.7 Test suites after all round-4 fixes (all green)
+## 5.7 Test suites after all round-4 fixes (all green)
 
 | Suite | Result |
 |-------|--------|
@@ -758,7 +661,7 @@ Found by running all 19 tools against the live instance, not by the model:
 | Zero-width bypass re-verification (live) | **12 / 12** |
 | Red-team report-payload re-verification (live) | **9 / 9** |
 
-## 6.8 Method & environment
+## 5.8 Method & environment
 
 - Target: `@piyapat/mssql-mcp-server` working tree, `src/index.ts` (~3030 lines).
 - Live DB: SQL Server 2025 (17.0.1000.7) Standard Developer Edition, a purpose-built
@@ -767,9 +670,9 @@ Found by running all 19 tools against the live instance, not by the model:
 - The MCP server was driven over real stdio MCP, over TCP:1433.
 - Model access: `qwen3.8-27b` via the self-hosted vLLM endpoint, run through the
   project-scoped helper scripts under `.claude/scripts/` (secret-bearing files
-  excluded from transmission). Raw model output is preserved in 6.10.
+  excluded from transmission). Raw model output is preserved in 5.10.
 
-## 6.9 Credit
+## 5.9 Credit
 
 The security review and red-teaming that surfaced and drove the round-4 fixes are
 credited to:
@@ -779,11 +682,11 @@ credited to:
 - Email: kietgboiz17@gmail.com
 
 Kietgboiz17 also reported the original v2.0.2 quote-aware guard bypass (the `--`
-inside a same-line string literal) privately on 2026-08-23 — see Parts 1–5.
+inside a same-line string literal) privately on 2026-08-23 — see Parts 1–4.
 
-## 6.10 Appendix — raw Qwen review output (`qwen3.8-reviewed.json`)
+## 5.10 Appendix — raw Qwen review output (`qwen3.8-reviewed.json`)
 
-Preserved verbatim for provenance; the two findings are analysed in 6.2 and 6.3.
+Preserved verbatim for provenance; the two findings are analysed in 5.2 and 5.3.
 
 ```json
 {
@@ -811,7 +714,7 @@ Preserved verbatim for provenance; the two findings are analysed in 6.2 and 6.3.
       "line": 473,
       "cwe": "CWE-185",
       "evidence": "const clean = sanitizeForAnalysis(sqlText).replace(/\\s+/g, \" \");",
-      "impact": "The regex patterns in DANGEROUS_STATEMENT_PATTERNS rely on standard whitespace matching; a Unicode separator that JS \\s does not match but SQL Server accepts between two keywords can bypass the block. (Model cited \\u00A0; verified: \\s does match \\u00A0 — the real gap is \\u200B/\\u200C/\\u200D/\\u2060, confirmed live and fixed. See 6.2.)",
+      "impact": "The regex patterns in DANGEROUS_STATEMENT_PATTERNS rely on standard whitespace matching; a Unicode separator that JS \\s does not match but SQL Server accepts between two keywords can bypass the block. (Model cited \\u00A0; verified: \\s does match \\u00A0 — the real gap is \\u200B/\\u200C/\\u200D/\\u2060, confirmed live and fixed. See 5.2.)",
       "recommendation": "Normalize all separator code points to ASCII space before testing against the dangerous patterns.",
       "file": "src/index.ts"
     }
