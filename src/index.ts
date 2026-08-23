@@ -101,7 +101,13 @@ const config: sql.config = {
         password: process.env.MSSQL_PASSWORD || "",
       }),
   options: {
-    encrypt: process.env.MSSQL_ENCRYPT === "true",
+    // Encrypt by default (opt OUT, not in) so credentials and query results
+    // aren't sent in cleartext when someone skips setting this. Only a literal
+    // "false" disables it — for local dev against an instance with no TLS cert.
+    encrypt: process.env.MSSQL_ENCRYPT !== "false",
+    // Certificate validation stays ON unless explicitly disabled — trusting an
+    // unvalidated cert defeats the point of enabling encryption in the first
+    // place (opens a MITM path), so this is opt-in, not opt-out.
     trustServerCertificate: process.env.MSSQL_TRUST_CERT === "true",
     requestTimeout: parseInt(process.env.MSSQL_REQUEST_TIMEOUT || "30000"),
   },
@@ -164,15 +170,67 @@ const ALLOWED_PROCEDURES = new Set(
 // Strip SQL comments and string literals so neither can be used to hide a
 // second statement, push a disallowed keyword to the front, or smuggle a
 // table name past the static analyzer (e.g. a literal containing "INSERT INTO").
-function stripComments(query: string): string {
-  return query
-    .replace(/--[^\n]*/g, " ") // single-line comments
-    .replace(/\/\*[\s\S]*?\*\//g, " "); // block comments
+//
+// This MUST be a single left-to-right pass, not "strip comments, then strip
+// literals" as two independent regex passes. A comment-stripping pass that
+// doesn't track quote state treats a `--` INSIDE a string literal as a real
+// comment marker and blanks everything after it — including a stacked write
+// statement the literal was hiding, e.g. `SELECT 'a--'; DELETE FROM Users`.
+// Scanning once means a token that opens a string/identifier consumes its own
+// closing delimiter before the scanner ever looks for a comment marker inside
+// it, so an embedded `--` or `;` in a literal can never smuggle anything.
+const SQL_TOKEN_RE = /--[^\n\r]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'|"(?:[^"]|"")*"|\[[^\]]*\]/g;
+
+type SqlToken = { type: "comment" | "squote" | "dquote" | "bracket" | "text"; value: string };
+
+function scanSql(text: string): SqlToken[] {
+  const tokens: SqlToken[] = [];
+  let lastIndex = 0;
+  SQL_TOKEN_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = SQL_TOKEN_RE.exec(text)) !== null) {
+    if (m.index > lastIndex) tokens.push({ type: "text", value: text.slice(lastIndex, m.index) });
+    const raw = m[0];
+    const type: SqlToken["type"] =
+      raw.startsWith("--") || raw.startsWith("/*")
+        ? "comment"
+        : raw.startsWith("'")
+        ? "squote"
+        : raw.startsWith('"')
+        ? "dquote"
+        : "bracket";
+    tokens.push({ type, value: raw });
+    lastIndex = SQL_TOKEN_RE.lastIndex;
+  }
+  if (lastIndex < text.length) tokens.push({ type: "text", value: text.slice(lastIndex) });
+  return tokens;
 }
 
-function stripStringLiterals(text: string): string {
-  // Replace 'single-quoted' and "double-quoted" literals with a placeholder.
-  return text.replace(/'(?:[^']|'')*'/g, " '' ").replace(/"(?:[^"]|"")*"/g, ' "" ');
+// Comments removed, everything else left verbatim (quotes included) — needed
+// where a caller must see the original quoting, e.g. detecting a leading
+// string/variable right after EXEC (dynamic SQL).
+function stripCommentsOnly(query: string): string {
+  return scanSql(query)
+    .map((t) => (t.type === "comment" ? " " : t.value))
+    .join("");
+}
+
+// Fully sanitized for keyword/target analysis: comments removed, single-quoted
+// literal content blanked, and double-quoted identifiers normalized to
+// bracket form. The connection runs with QUOTED_IDENTIFIER ON (the
+// tedious/SQL Server default), so `"Table"` is an OBJECT NAME, not a string
+// literal — blanking it the way a real literal is blanked would erase the
+// very table name the write-target checks below rely on, letting
+// `UPDATE "Users" SET ...` or `DROP TABLE "Users"` slip past undetected.
+function sanitizeForAnalysis(query: string): string {
+  return scanSql(query)
+    .map((t) => {
+      if (t.type === "comment") return " ";
+      if (t.type === "squote") return " '' ";
+      if (t.type === "dquote") return `[${t.value.slice(1, -1).replace(/""/g, '"')}]`;
+      return t.value; // bracketed identifier or plain text — preserved
+    })
+    .join("");
 }
 
 // Result of classifying a query's entry point.
@@ -205,8 +263,7 @@ function isTemporaryTarget(name: string): boolean {
 // treated as a potential persistent write and rejected. The DB-level
 // db_denydatawriter grant is the backstop for anything this misses.
 function writesToPersistentTable(sqlText: string): boolean {
-  const clean = stripStringLiterals(stripComments(sqlText));
-  const normalized = clean.replace(/\s+/g, " ");
+  const normalized = sanitizeForAnalysis(sqlText).replace(/\s+/g, " ");
 
   // Unconditional red flags: statements that either cannot be statically
   // resolved (any EXEC / dynamic SQL — this also closes the hole where a
@@ -268,28 +325,61 @@ function writesToPersistentTable(sqlText: string): boolean {
 // server-level / OS-level operations no LLM-driven tool should ever run:
 // command execution, instance reconfiguration, security-principal changes,
 // permission grants, ad-hoc remote access, and database drop/restore.
+// SCOPE NOTE: this is a BLOCKLIST, and a blocklist is never complete. It stops
+// the well-known footguns in write mode; the REAL control is the permissions of
+// the login this server connects as (see scripts/create-readonly-login.sql).
+// Never run write mode with a login holding sysadmin / securityadmin /
+// role-admin rights.
 const DANGEROUS_STATEMENT_PATTERNS: Array<{ re: RegExp; label: string }> = [
+  // --- dynamic SQL (must stay in this list) ---------------------------------
+  // findDangerousStatement analyzes text whose string-literal CONTENT has been
+  // blanked, so that a literal cannot smuggle a stacked statement past the
+  // analyzer. The flip side is that it cannot see inside the string a dynamic
+  // SQL call would execute — so ANY dynamic SQL voids every other pattern here:
+  //     EXEC sp_executesql N'EXEC xp_cmdshell ''whoami'''
+  // reaches the analyzer as `EXEC sp_executesql N ''` — nothing left to match.
+  // Blocking the dynamic-SQL entry points is what makes the rest of this list
+  // mean anything in write mode.
+  { re: /(?<![A-Z0-9_])SP_EXECUTESQL(?![A-Z0-9_])/i, label: "sp_executesql (dynamic SQL)" },
+  { re: /(?<![A-Z0-9_])EXEC(?:UTE)?\s*\(/i, label: "EXEC(<string>) dynamic SQL" },
+
+  // --- OS / filesystem / command execution ----------------------------------
   { re: /(?<![A-Z0-9_])XP_CMDSHELL(?![A-Z0-9_])/i, label: "xp_cmdshell" },
-  { re: /(?<![A-Z0-9_])XP_REG(?:WRITE|DELETE\w*)(?![A-Z0-9_])/i, label: "registry modification (xp_reg*)" },
+  { re: /(?<![A-Z0-9_])SP_OA[A-Z]+(?![A-Z0-9_])/i, label: "OLE automation (sp_OA*)" },
+  { re: /(?<![A-Z0-9_])XP_REG[A-Z]+(?![A-Z0-9_])/i, label: "registry access (xp_reg*)" },
+  { re: /(?<![A-Z0-9_])XP_(?:DIRTREE|SUBDIRS|FILEEXIST|CREATESUBDIR|DELETESUBDIR)(?![A-Z0-9_])/i, label: "filesystem access (xp_dirtree / xp_fileexist / ...)" },
+  { re: /(?<![A-Z0-9_])BULK\s+INSERT(?![A-Z0-9_])/i, label: "BULK INSERT (reads a server-side file)" },
+
+  // --- instance configuration -----------------------------------------------
   { re: /(?<![A-Z0-9_])SP_CONFIGURE(?![A-Z0-9_])/i, label: "sp_configure" },
   { re: /(?<![A-Z0-9_])RECONFIGURE(?![A-Z0-9_])/i, label: "RECONFIGURE" },
   { re: /(?<![A-Z0-9_])SHUTDOWN(?![A-Z0-9_])/i, label: "SHUTDOWN" },
   { re: /(?<![A-Z0-9_])KILL(?![A-Z0-9_])/i, label: "KILL" },
+
+  // --- database lifecycle ----------------------------------------------------
   { re: /(?<![A-Z0-9_])DROP\s+DATABASE(?![A-Z0-9_])/i, label: "DROP DATABASE" },
   { re: /(?<![A-Z0-9_])ALTER\s+DATABASE(?![A-Z0-9_])/i, label: "ALTER DATABASE" },
   { re: /(?<![A-Z0-9_])RESTORE\s+(?:DATABASE|LOG)(?![A-Z0-9_])/i, label: "RESTORE" },
   { re: /(?<![A-Z0-9_])BACKUP\s+(?:DATABASE|LOG)(?![A-Z0-9_])/i, label: "BACKUP" },
-  { re: /(?<![A-Z0-9_])(?:CREATE|ALTER|DROP)\s+(?:LOGIN|USER|CREDENTIAL|CERTIFICATE)(?![A-Z0-9_])/i, label: "security principal change" },
+
+  // --- security principals / privilege escalation ---------------------------
+  { re: /(?<![A-Z0-9_])(?:CREATE|ALTER|DROP)\s+(?:LOGIN|USER|CREDENTIAL|CERTIFICATE|ASSEMBLY)(?![A-Z0-9_])/i, label: "security principal / assembly change" },
+  { re: /(?<![A-Z0-9_])ALTER\s+(?:SERVER\s+)?ROLE(?![A-Z0-9_])/i, label: "role membership change (ALTER ROLE)" },
+  { re: /(?<![A-Z0-9_])SP_(?:ADD|DROP)(?:SRV)?ROLEMEMBER(?![A-Z0-9_])/i, label: "role membership change (sp_addrolemember / sp_addsrvrolemember)" },
+  { re: /(?<![A-Z0-9_])EXECUTE\s+AS(?![A-Z0-9_])/i, label: "EXECUTE AS (impersonation)" },
   { re: /(?<![A-Z0-9_])ALTER\s+SERVER(?![A-Z0-9_])/i, label: "ALTER SERVER" },
   { re: /(?<![A-Z0-9_])(?:GRANT|DENY|REVOKE)(?![A-Z0-9_])/i, label: "permission change (GRANT/DENY/REVOKE)" },
-  { re: /(?<![A-Z0-9_])(?:OPENROWSET|OPENDATASOURCE)(?![A-Z0-9_])/i, label: "ad-hoc remote access (OPENROWSET/OPENDATASOURCE)" },
+
+  // --- remote / linked-server access ----------------------------------------
+  { re: /(?<![A-Z0-9_])(?:OPENROWSET|OPENDATASOURCE|OPENQUERY)(?![A-Z0-9_])/i, label: "ad-hoc / linked-server access (OPENROWSET/OPENDATASOURCE/OPENQUERY)" },
+  { re: /(?<![A-Z0-9_])SP_(?:ADD|DROP)LINKEDSERVER(?![A-Z0-9_])/i, label: "linked server change (sp_addlinkedserver)" },
 ];
 
 // Returns the label of the first dangerous statement found, or null.
 // Comments and string literals are stripped first so they cannot hide or
 // falsely trigger a match.
 function findDangerousStatement(sqlText: string): string | null {
-  const clean = stripStringLiterals(stripComments(sqlText)).replace(/\s+/g, " ");
+  const clean = sanitizeForAnalysis(sqlText).replace(/\s+/g, " ");
   for (const { re, label } of DANGEROUS_STATEMENT_PATTERNS) {
     if (re.test(clean)) return label;
   }
@@ -303,8 +393,8 @@ function findDangerousStatement(sqlText: string): string | null {
 // db_denydatawriter, with GRANT EXECUTE only on whitelisted procs). See
 // scripts/create-readonly-login.sql.
 function classifyQuery(query: string): QueryClassification {
-  const noComments = stripComments(query);
-  const noLiterals = stripStringLiterals(noComments).replace(/;\s*$/, "");
+  const noComments = stripCommentsOnly(query);
+  const noLiterals = sanitizeForAnalysis(query).replace(/;\s*$/, "");
 
   // First significant token (skip whitespace and opening parens).
   const leading = noComments.replace(/^[\s(]+/, "");
@@ -2026,20 +2116,23 @@ async function handleIndexFragmentation(args: IndexFragmentationArgs): Promise<s
   return lines.join("\n");
 }
 
-const TOP_QUERY_METRICS: Record<string, { column: string; label: string }> = {
-  cpu: { column: "qs.total_worker_time", label: "total CPU" },
-  duration: { column: "qs.total_elapsed_time", label: "total duration" },
-  reads: { column: "qs.total_logical_reads", label: "total logical reads" },
-  writes: { column: "qs.total_logical_writes", label: "total logical writes" },
-  memory: { column: "qs.total_grant_kb", label: "total memory grant" },
-  executions: { column: "qs.execution_count", label: "execution count" },
-};
+// A Map (not a plain object) so a metric name like "constructor" or
+// "__proto__" can't resolve to an inherited Object.prototype value instead of
+// failing the lookup below.
+const TOP_QUERY_METRICS: Map<string, { column: string; label: string }> = new Map([
+  ["cpu", { column: "qs.total_worker_time", label: "total CPU" }],
+  ["duration", { column: "qs.total_elapsed_time", label: "total duration" }],
+  ["reads", { column: "qs.total_logical_reads", label: "total logical reads" }],
+  ["writes", { column: "qs.total_logical_writes", label: "total logical writes" }],
+  ["memory", { column: "qs.total_grant_kb", label: "total memory grant" }],
+  ["executions", { column: "qs.execution_count", label: "execution count" }],
+]);
 
 async function handleTopQueries(args: TopQueriesArgs): Promise<string> {
   const { metric = "cpu", top = 10, response_format = "markdown" } = args;
-  const metricDef = TOP_QUERY_METRICS[metric];
+  const metricDef = TOP_QUERY_METRICS.get(metric);
   if (!metricDef) {
-    throw new Error(`Unknown metric '${metric}'. Use one of: ${Object.keys(TOP_QUERY_METRICS).join(", ")}.`);
+    throw new Error(`Unknown metric '${metric}'. Use one of: ${Array.from(TOP_QUERY_METRICS.keys()).join(", ")}.`);
   }
   const limit = Math.max(1, Math.min(Math.floor(top), 50));
   const dbPool = await getPool();
