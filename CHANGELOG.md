@@ -6,10 +6,13 @@ will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 2.0.2 (security release)
+## [2.0.2] — 2026-08-23 (security release)
 
-> Not published yet. Everything below is in the working tree; `npm publish` and
-> the version bump are deliberately held back.
+> **Upgrade immediately if you are on 2.0.1 or earlier.** The guard bypass below
+> is exploitable under the default read-only configuration.
+>
+> **Breaking:** minimum Node is now **22** (was 18) — `mssql` 12 depends on
+> `tedious` 20, which requires Node 22.
 
 ### Security
 
@@ -96,5 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Lock, blocking, and deadlock monitoring for SQL Server 2019/2022/2025
   (all editions incl. Express) with version/edition detection.
 
-[Unreleased]: https://github.com/PiyapatRag/mssql-mcp-server/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/PiyapatRag/mssql-mcp-server/compare/v2.0.2...HEAD
+[2.0.2]: https://github.com/PiyapatRag/mssql-mcp-server/compare/v2.0.1...v2.0.2
+[2.0.1]: https://github.com/PiyapatRag/mssql-mcp-server/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/PiyapatRag/mssql-mcp-server/releases/tag/v2.0.0

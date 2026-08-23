@@ -2773,12 +2773,30 @@ async function handleGetDeadlocks(args: GetDeadlocksArgs): Promise<string> {
   return lines.join("\n");
 }
 
+// Read the real version out of package.json so the version advertised over MCP
+// can't drift from the published one (it sat at 2.0.0 through the 2.0.1
+// release). Falls back rather than failing startup if the file isn't reachable.
+function packageVersion(): string {
+  for (const candidate of [
+    path.join(__dirname, "..", "package.json"),
+    path.join(__dirname, "package.json"),
+  ]) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(candidate, "utf8")) as { version?: unknown };
+      if (typeof parsed.version === "string" && parsed.version) return parsed.version;
+    } catch {
+      // try the next candidate
+    }
+  }
+  return "0.0.0-unknown";
+}
+
 // Main server setup
 async function main() {
   const server = new Server(
     {
       name: "mssql-mcp-server",
-      version: "2.0.0",
+      version: packageVersion(),
     },
     {
       capabilities: {

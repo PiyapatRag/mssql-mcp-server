@@ -10,6 +10,14 @@ A secure, read-only Model Context Protocol (MCP) server for Microsoft SQL Server
 
 📦 **npm:** [@piyapat/mssql-mcp-server](https://www.npmjs.com/package/@piyapat/mssql-mcp-server)
 
+## Requirements
+
+- **Node.js 22 or newer.** Raised from 18 in v2.0.2: `mssql` 12 depends on
+  `tedious` 20, which requires Node 22.
+- SQL Server 2019 (15.x), 2022 (16.x), or 2025 (17.x) — all editions including
+  Express. Azure SQL Database works for the query/schema tools; see the
+  per-edition notes from `mssql_test_connection`.
+
 ## Quick Start with npx
 
 You can run this MCP server directly without installation using `npx`:
@@ -340,7 +348,7 @@ npm start
 
 If you get an error running with npx:
 
-1. Ensure Node.js 18+ is installed:
+1. Ensure Node.js 22+ is installed:
 ```bash
 node --version
 ```

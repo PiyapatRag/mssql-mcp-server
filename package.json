@@ -1,6 +1,6 @@
 {
   "name": "@piyapat/mssql-mcp-server",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Secure, read-only MCP server for Microsoft SQL Server with performance monitoring",
   "main": "build/index.js",
   "bin": {
