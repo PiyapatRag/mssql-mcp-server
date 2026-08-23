@@ -6,11 +6,15 @@ will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.3] — 2026-08-23
 
 Found by an end-to-end run of all 19 tools against a live SQL Server 2025
 (17.0.1000.7) instance, plus an adversarial red-team pass. Security review and
 red-teaming credited to **Kietgboiz17** (https://github.com/kietgboiz17).
+
+> 🙏 **Thank you to [Kietgboiz17](https://github.com/kietgboiz17)**
+> (kietgboiz17@gmail.com) for the security review and red-teaming that surfaced
+> and drove these fixes.
 
 Post-fix verification: an independent red-team pass (54 payloads) reported **0
 guard bypasses**, and two follow-up source-review findings (string-literal /

@@ -406,6 +406,14 @@ The guard battery in
 compiled analyzer against ~100 attack cases and runs in CI — `npm run
 test:security` reproduces it locally.
 
+## Security Acknowledgements
+
+🙏 **Thank you to [Kietgboiz17](https://github.com/kietgboiz17)**
+(kietgboiz17@gmail.com) for the security review, vulnerability report, and
+red-teaming that hardened this project — including the read-only guard bypass
+fixed in 2.0.2 and the additional guard hardening in 2.0.3. See
+[CHANGELOG.md](CHANGELOG.md) and [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
+
 ## Best Practices
 
 1. **Always use read-only accounts** in production
